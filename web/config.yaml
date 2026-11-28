@@ -42,4 +42,14 @@ k250:
   link_status: "../skill/vfk250/scripts/link_status.py"
   patterns: ["tide", "swell", "tease", "arc", "compress", "sweep_drop", "speed_sweep", "signature"]
 
+# Network exposure. The bridge drives a box that can HURT someone, so it binds
+# LOOPBACK by default — the machine itself only. To reach it from another device
+# set host: 0.0.0.0 (or a LAN IP) deliberately. Anything past loopback is
+# UNAUTHENTICATED: put your own auth in front of it (proxy, tunnel with access
+# control). State-changing requests are gated on Origin; localhost is always
+# allowed and a tunnel/public origin must be listed in allowed_origins, e.g.
+#   allowed_origins: ["https://k250.example.com"]
+host: 127.0.0.1
+allowed_origins: []
+
 port: 6868

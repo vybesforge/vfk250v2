@@ -29,6 +29,11 @@ from [k250-forge](https://github.com/vybesforge/k250-forge) (Apache-2.0, see
   check and the stop use whichever the host offers (`/proc` + `bluetoothctl`,
   the CIM process list + the present Bluetooth PnP tree, or `ps -eo` +
   `system_profiler`); the driver itself is one code path everywhere.
+- **Loopback by default** — the web bridge listens on `127.0.0.1` and gates
+  state-changing requests on `Origin`; exposing it past loopback is deliberate
+  and, being unauthenticated, yours to protect. A stop is CONFIRMED only when the
+  box echoes `PW=0`, and a driver that can't confirm zero exits with an
+  unconfirmed-zero code rather than claiming success.
 
 ## The safety contract (both halves)
 

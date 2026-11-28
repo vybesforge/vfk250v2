@@ -196,6 +196,26 @@ def _ch_active(ca, i: int) -> bool:
     return False
 
 
+async def _zero_reported(k, tries: int = 3) -> bool:
+    """True only when the BOX reports PW=0. A write echo is the only witness —
+    PW never appears in a read-all — so clear `last`, re-send the zero and wait
+    for the echo. Re-sending PW=0 can never raise power, so retrying while we
+    wait is safe. Writing zero and assuming it landed is the claim the stop rule
+    forbids; this is what gates 'all zeroed (ended)'."""
+    for _ in range(tries):
+        k.last = None
+        await k.send({"PW": "0"})
+        for _ in range(15):
+            pw = (k.last or {}).get("PW")
+            if pw is not None:
+                try:
+                    return float(pw) == 0.0
+                except (TypeError, ValueError):
+                    return False
+            await asyncio.sleep(0.1)
+    return False
+
+
 async def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("pattern", help="channel-1 pattern name (see k250_play.py --list)")
@@ -371,11 +391,15 @@ async def main() -> int:
                         await pl.select(ch)
                         await k.send({"PW": "0"})
                         await asyncio.sleep(0.15)
+                # The box must REPORT zero — the writes going out over a live link
+                # is not the same claim, and a read-all never carries PW.
+                confirmed = await _zero_reported(k)
+                if not confirmed:
+                    raise RuntimeError("the box never echoed PW=0")
                 await asyncio.sleep(0.8)
                 await k.send(READ_ALL)
                 await asyncio.sleep(1.0)
                 log("last:", json.dumps(k.last, ensure_ascii=False))
-                confirmed = True
             except Exception as e:
                 # the link dropped mid-shutdown — a dead link must never leave the
                 # box hot. One fresh reconnect attempt to zero every driven channel.
@@ -395,10 +419,12 @@ async def main() -> int:
                             await k2.send({"PW": "0"})
                             await asyncio.sleep(0.05)
                         await asyncio.sleep(0.5)
+                        confirmed = await _zero_reported(k2)
+                        if not confirmed:
+                            raise RuntimeError("the box never echoed PW=0 after reconnect")
                         await k2.send(READ_ALL)
                         await asyncio.sleep(1.0)
                         log("reconnect zero state:", json.dumps(k2.last or {}, ensure_ascii=False))
-                        confirmed = True
                 except Exception as e2:
                     log(f"!! reconnect zeroing ALSO failed: {e2}")
             if confirmed:

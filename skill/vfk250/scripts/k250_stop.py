@@ -5,9 +5,10 @@ Designed to be safe to run at any time, including while a pattern is playing:
 first kills any running pattern process (so it can't re-send power), then
 connects and writes PW=0 to every channel the box reports as plugged in.
 
-Usage: python k250_stop.py
-Exit 0 on success, 1 if the box couldn't be reached (caller must treat that as
-UNSAFE — the box may still be energised).
+The stop is CONFIRMED only when the box echoes PW=0 (a write echo is the only
+witness — PW never appears in a read-all). Exit 0 = confirmed zero; exit 1 =
+NOT confirmed (box unreachable, or it never reported zero) — the caller must
+treat that as UNSAFE, because the box may still be energised.
 """
 import asyncio
 import os
@@ -134,9 +135,34 @@ async def main():
             await asyncio.sleep(0.05)
             await k.send({"PW": "0"})
             await asyncio.sleep(0.05)
-        await k.send({"PW": "0"})
-        await asyncio.sleep(0.5)
-        print(f"STOPPED: PW=0 written to channels {[c + 1 for c in chans]}", flush=True)
+
+        # CONFIRMED only when the BOX reports PW=0. A write echo is the only
+        # witness — PW never appears in a read-all — so clear `last`, re-send the
+        # zero and wait for the echo. Re-sending PW=0 can never raise power, so
+        # retrying while we wait is safe; a missing echo is reported as UNCONFIRMED.
+        confirmed = False
+        for _ in range(3):
+            k.last = None
+            await k.send({"PW": "0"})
+            for _ in range(15):
+                pw = (k.last or {}).get("PW")
+                if pw is not None:
+                    try:
+                        confirmed = float(pw) == 0.0
+                    except (TypeError, ValueError):
+                        confirmed = False
+                    break
+                await asyncio.sleep(0.1)
+            if confirmed:
+                break
+        if confirmed:
+            print(f"STOPPED: PW=0 confirmed by the box on channels {[c + 1 for c in chans]}",
+                  flush=True)
+            return 0
+        print("STOP UNCONFIRMED: the box never reported PW=0 — IT MAY STILL BE ENERGISED!\n"
+              "  Get to it physically and hold any knob for 2 seconds to power it off.",
+              flush=True)
+        return 1
     return 0
 
 

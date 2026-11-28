@@ -56,6 +56,20 @@ runs as a detached subprocess with that interpreter).
   server-side. Off means off.
 - **Voice** — mic (STT) in, TTS out (🔇/🔊 button), both optional services.
 
+## Network exposure
+
+The bridge drives a box that can hurt someone, so it **listens on `127.0.0.1`**
+by default — the machine itself only. To reach it from another device, set
+`host:` in `config.yaml` (or `VFK250_HOST`) deliberately; there is **no
+authentication**, so anything past loopback is yours to protect (a reverse proxy
+with auth, a tunnel with access control).
+
+State-changing requests are gated on `Origin`: localhost is always allowed, and a
+tunnel/public origin must be listed under `allowed_origins:` in `config.yaml`.
+That gate is what stops a random web page in the wearer's own browser from POSTing
+to a local server for free — loopback is not a boundary against the wearer's own
+browser.
+
 ## Layout
 
 ```
@@ -83,7 +97,9 @@ by nothing and ignored. Health dots in the header show what's live.
 
 ## Notes
 
-- No authentication — run it on a trusted LAN or tunnel it yourself.
+- No authentication — the bridge binds **loopback** by default and gates
+  state-changing requests on `Origin`. If you expose it further (LAN, tunnel),
+  put your own auth in front of it. See *Network exposure*.
 - Persona portraits are **not** shipped. Bring your own reference plates or
   let a persona render its first portrait from its `portrait_prompt`
   (needs ComfyUI + a checkpoint). See `profiles/README.md`.

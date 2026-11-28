@@ -60,8 +60,53 @@ def _load_cfg() -> dict[str, Any]:
 
 CFG: dict[str, Any] = _load_cfg()
 
+# ------------------------------------------------------------ bind + origin gate
+# This bridge drives a box that can hurt someone, so:
+#   * it LISTENS ON LOOPBACK by default (127.0.0.1). Exposing it to the LAN or a
+#     tunnel is deliberate — set `host:` in config.yaml or VFK250_HOST. Anything
+#     past loopback is UNAUTHENTICATED; put your own auth in front of it.
+#   * state-changing requests from a browser are gated on Origin. Loopback is NOT
+#     a boundary against the wearer's OWN browser: a random web page can POST to
+#     a local server for free (a cross-site POST is a CORS "simple request" — no
+#     preflight, and many servers parse the body regardless of type). Localhost
+#     origins are always allowed; add a tunnel/public origin under
+#     `allowed_origins:` in config.yaml.
+_LOCAL_ORIGIN = re.compile(r"^https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$", re.I)
+
+
+def _server_host() -> str:
+    return (os.environ.get("VFK250_HOST") or str(CFG.get("host") or "") or "127.0.0.1").strip()
+
+
+def _allowed_origins() -> list[str]:
+    return [str(o).strip().rstrip("/") for o in (CFG.get("allowed_origins") or []) if str(o).strip()]
+
+
+def _origin_ok(origin: str | None) -> bool:
+    """A MISSING Origin is fine (curl, some same-origin requests); any Origin that
+    IS present must be local or explicitly allow-listed."""
+    if not origin:
+        return True
+    origin = origin.strip().rstrip("/")
+    return bool(_LOCAL_ORIGIN.match(origin)) or origin in _allowed_origins()
+
+
 app = FastAPI(title="vfk250-web")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_allowed_origins(),
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$",
+    allow_methods=["*"], allow_headers=["*"])
+
+
+@app.middleware("http")
+async def _origin_gate(request: Request, call_next):
+    """Refuse a state-changing request whose Origin is neither local nor
+    allow-listed. The GET routes stay open (they only read)."""
+    if request.method not in ("GET", "HEAD", "OPTIONS") and not _origin_ok(request.headers.get("origin")):
+        return JSONResponse({"ok": False, "error": "cross-origin request refused"},
+                            status_code=403)
+    return await call_next(request)
 
 # ---------------------------------------------------------------- llm routing
 _llm_cache: dict[str, Any] = {"winner": None, "ts": 0.0}
@@ -102,6 +147,10 @@ K250 = {
     "queue": [],             # stim commands waiting for the box to free up
 }
 QUEUE_MAX = 3
+# Serialises the check-then-launch step: two /api/k250/drive requests that arrive
+# at the same moment must not each pass the "is it busy?" check and each start a
+# driver (two BLE clients on one box — the thing the contract forbids).
+K250_LOCK = asyncio.Lock()
 COMFY_CFG = CFG.get("comfyui", {})
 
 # ceilings survive restarts — the page is the authority, and its word persists
@@ -182,17 +231,20 @@ async def _queue_worker() -> None:
     """Fire queued stim blocks once the box is genuinely free."""
     while True:
         await asyncio.sleep(2)
-        if not K250["queue"] or _block_active():
+        if not K250["queue"]:
             continue
-        snap = await k250_status_snapshot()
-        if snap.get("drivers"):   # someone else owns the link — wait, never compete
-            continue
-        job = K250["queue"].pop(0)
-        try:
-            await _launch_block(job["level"], job["pattern"], job["secs"],
-                                job.get("level2"), job.get("pattern2"))
-        except Exception:
-            pass
+        async with K250_LOCK:
+            if _block_active():
+                continue
+            snap = await k250_status_snapshot()
+            if snap.get("drivers"):   # someone else owns the link — wait, never compete
+                continue
+            job = K250["queue"].pop(0)
+            try:
+                await _launch_block(job["level"], job["pattern"], job["secs"],
+                                    job.get("level2"), job.get("pattern2"))
+            except Exception:
+                pass
 
 
 def _check_pattern_drift() -> None:
@@ -273,21 +325,22 @@ async def k250_drive(req: Request):
     if level2 is not None:
         level2 = max(0.0, min(float(level2), K250["ceiling2"]))
     try:
-        busy = _block_active()
-        if not busy:
-            snap = await k250_status_snapshot()
-            busy = bool(snap.get("drivers"))
-        if busy:
-            if len(K250["queue"]) >= QUEUE_MAX:
-                return {"ok": False, "queued": False, "error": "queue full — wait for the current block"}
-            K250["queue"].append({"level": level, "pattern": pattern, "secs": secs,
-                                  "level2": level2, "pattern2": pattern2,
-                                  "queued_at": time.time()})
-            return {"ok": True, "queued": True, "position": len(K250["queue"]),
-                    "level": level, "pattern": pattern, "secs": secs,
-                    "level2": level2, "pattern2": pattern2,
-                    "state": "QUEUED_BEHIND_RUNNING_BLOCK"}
-        result = await _launch_block(level, pattern, secs, level2, pattern2)
+        async with K250_LOCK:
+            busy = _block_active()
+            if not busy:
+                snap = await k250_status_snapshot()
+                busy = bool(snap.get("drivers"))
+            if busy:
+                if len(K250["queue"]) >= QUEUE_MAX:
+                    return {"ok": False, "queued": False, "error": "queue full — wait for the current block"}
+                K250["queue"].append({"level": level, "pattern": pattern, "secs": secs,
+                                      "level2": level2, "pattern2": pattern2,
+                                      "queued_at": time.time()})
+                return {"ok": True, "queued": True, "position": len(K250["queue"]),
+                        "level": level, "pattern": pattern, "secs": secs,
+                        "level2": level2, "pattern2": pattern2,
+                        "state": "QUEUED_BEHIND_RUNNING_BLOCK"}
+            result = await _launch_block(level, pattern, secs, level2, pattern2)
         if result.get("blocked"):
             return JSONResponse({"ok": False, "queued": False,
                                  "error": "link busy: " + result.get("raw", "")}, status_code=200)
@@ -976,4 +1029,12 @@ async def index():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("VFK250_PORT", CFG.get("port", 8091))), log_level="warning")
+    _host = _server_host()
+    if _host not in ("127.0.0.1", "localhost", "::1"):
+        print(f"[warn] binding {_host} — this bridge has NO authentication. "
+              f"Put your own auth in front of it.", flush=True)
+    try:
+        _port = int(os.environ.get("VFK250_PORT") or CFG.get("port") or 8091)
+    except (TypeError, ValueError):
+        _port = 8091
+    uvicorn.run(app, host=_host, port=_port, log_level="warning")
