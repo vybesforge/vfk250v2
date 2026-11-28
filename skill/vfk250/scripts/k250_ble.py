@@ -23,6 +23,38 @@ def clean(txt: str) -> str:
     return txt.replace("\n", " ").replace("\r", " ").replace("\x00", "")
 
 
+def _take_object(buf):
+    """Pull one complete JSON object out of a notification buffer.
+
+    Returns `(obj, remaining)`. `obj` is None when the buffer does not hold a
+    complete object yet — a frame split across packets is a `{"AC"` fragment and
+    must simply wait for the rest.
+
+    On a frame that can NEVER parse, the buffer is first re-synced to the LAST
+    `{`: without that, a prefix of junk sits in front of every later frame, so
+    nothing parses again and `last` freezes at the last good state forever. Junk
+    with no `{` at all is dropped, and the buffer is capped so it cannot grow
+    without bound. Two complete objects arriving together yield the LAST one.
+    """
+    if not buf:
+        return None, buf
+    try:
+        return json.loads(buf), ""
+    except Exception:
+        pass
+    i = buf.rfind("{")
+    if i < 0:
+        return None, ""
+    if i > 0:
+        buf = buf[i:]
+    if len(buf) > 4096:
+        return None, ""
+    try:
+        return json.loads(buf), ""
+    except Exception:
+        return None, buf
+
+
 class K250:
     def __init__(self, client):
         self.cl = client
@@ -34,11 +66,9 @@ class K250:
 
     def _on_notify(self, _sender, data):
         self.buf += clean(data.decode("utf-8", "replace"))
-        try:
-            obj = json.loads(self.buf)
-        except Exception:
+        obj, self.buf = _take_object(self.buf)
+        if obj is None:
             return
-        self.buf = ""
         self.last = obj
         print("STATE:", json.dumps(obj, ensure_ascii=False), flush=True)
 
