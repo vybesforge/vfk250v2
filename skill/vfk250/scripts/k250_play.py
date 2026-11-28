@@ -1894,6 +1894,15 @@ async def main():
     lim_path = find_limits(a.limits)
     lim = load_limits(lim_path)
     file_ceiling = ((lim or {}).get("power") or {}).get("max_percent")
+    # FAIL CLOSED. No limits file AND no explicit --hardcap used to mean a 100%
+    # cap — i.e. no ceiling at all, on a box that can hurt someone. Refuse and say
+    # how to fix it. (The k250-scene wrapper and the V2 launcher always pass one,
+    # so this only ever bites a hand-typed `python k250_play.py ...`.)
+    if not lim and a.hardcap is None:
+        print("REFUSED: no limits file and no --hardcap, so this run would have NO power "
+              "ceiling. Pass --hardcap N (the wearer's agreed maximum) or point --limits "
+              "at a limits file. A driver without a ceiling does not run.", flush=True)
+        return 2
     a.hardcap, a.max_rate, a.ma_top, a.channel_caps = apply_limits(
         a, lim, override=bool(a.override_ceiling))
     if a.override_ceiling and file_ceiling is not None \

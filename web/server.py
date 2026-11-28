@@ -156,6 +156,13 @@ K250 = {
     "queue": [],             # stim commands waiting for the box to free up
 }
 QUEUE_MAX = 3
+# ONE contract for a block's length, shared by the API, the AI tag parser, the
+# prompt and the UI. They used to disagree (5-600 in the API, 30-600 in the
+# prompt and the tag parser, 60/300/600 in the UI), so the same request could be
+# accepted by one path and clamped by another. The ENGINE allows 1-3600; the web
+# app deliberately stays inside a narrower, safer band.
+SECS_MIN = 30
+SECS_MAX = 600
 # Serialises the check-then-launch step: two /api/k250/drive requests that arrive
 # at the same moment must not each pass the "is it busy?" check and each start a
 # driver (two BLE clients on one box — the thing the contract forbids).
@@ -323,7 +330,7 @@ async def k250_drive(req: Request):
     body = await req.json()
     allowed = set(CFG["k250"].get("patterns", []))
     level = float(body.get("level", 10))
-    secs = max(5, min(600, int(body.get("secs", 300))))
+    secs = max(SECS_MIN, min(SECS_MAX, int(body.get("secs", 300))))
     pattern = body.get("pattern", "swell")
     if pattern not in allowed:
         return JSONResponse({"ok": False, "error": f"unknown pattern {pattern!r}"}, status_code=200)
@@ -398,9 +405,17 @@ async def k250_stop():
         )
         out, _ = await p.communicate()
         text = out.decode().strip()
-        confirmed = "PW\": 0" in text or "PW': 0" in text or 'PW": 0' in text
+        rc = p.returncode
+        # The stop script's EXIT CODE is the verdict, not the text: 0 = the box
+        # echoed PW=0 on every plugged channel, 1 = NOT confirmed (unreachable, or
+        # no zero report). The text is kept as evidence for the operator, never as
+        # the decision. `ok` therefore means "the stop is CONFIRMED" — a stop that
+        # returned with nothing proven is NOT ok.
+        confirmed = (rc == 0) and ("PW\": 0" in text or "PW': 0" in text
+                                   or 'PW": 0' in text or "confirmed by the box" in text)
         K250.update(running=False, level=0, level2=0, pattern2=None, pid=None, ends_at=None)
-        return {"ok": True, "confirmed_zero": confirmed, "dropped_queued": dropped, "raw": text[-400:]}
+        return {"ok": confirmed, "confirmed_zero": confirmed, "exit_code": rc,
+                "dropped_queued": dropped, "raw": text[-400:]}
     except Exception as e:
         K250.update(running=False, level=0, level2=0, pattern2=None, pid=None, ends_at=None)
         return JSONResponse({"ok": False, "error": str(e), "dropped_queued": dropped}, status_code=200)
@@ -531,7 +546,7 @@ def _shared_mechanics() -> str:
         "3. To move the current, put AT MOST ONE tag in your reply, on its own line, "
         "in exactly this shape:\n"
         "[[stim level=40 pattern=swell secs=300]]\n"
-        f"level = whole number 1-{ceil}; pattern = one of: {patterns}; secs = 30-600.\n"
+        f"level = whole number 1-{ceil}; pattern = one of: {patterns}; secs = {SECS_MIN}-{SECS_MAX}.\n"
         "Only if channel 2 is wired this session, you may add two more fields before the "
         f"closing brackets: level2 (whole number 0-{ceil2}) and pattern2, e.g.\n"
         "[[stim level=40 pattern=swell secs=300 level2=12 pattern2=tide]]\n"
@@ -626,7 +641,7 @@ def _parse_stim(text: str) -> tuple[dict[str, Any] | None, str]:
     stim: dict[str, Any] = {
         "level": min(float(m.group(1)), K250["ceiling"]),
         "pattern": pattern,
-        "secs": max(30, min(600, int(float(m.group(3))))),
+        "secs": max(SECS_MIN, min(SECS_MAX, int(float(m.group(3))))),
     }
     if m.group(4) is not None and m.group(5) is not None and m.group(5).lower() in allowed:
         stim["level2"] = min(float(m.group(4)), K250["ceiling2"])
@@ -829,12 +844,6 @@ async def _prewarm_qedit():
         cands = sorted((q for q in IMG_DIR.glob(f"plates_{slug}_*.png") if q.is_file()),
                        key=lambda q: q.stat().st_mtime, reverse=True)
         if not cands:
-            cands = sorted((q for q in IMG_DIR.glob("mmweb_*.png") if q.is_file()),
-                           key=lambda q: q.stat().st_mtime, reverse=True)
-        if not cands:
-            cands = sorted((q for q in IMG_DIR.glob("mm_*.png") if q.is_file()),
-                           key=lambda q: q.stat().st_mtime, reverse=True)
-        if not cands:
             return                      # nothing to warm against
         ref = cands[0]
     cmd = [str(_script_path(COMFY_CFG.get("qedit", "helpers/pg_qedit"))),
@@ -1022,8 +1031,13 @@ async def health():
     except Exception:
         out["tts"] = "down"
     try:
+        # Address comes from config (the same `stt.url` the transcribe endpoint
+        # uses) — a hardcoded port reported "down" for anyone who moved Whisper.
+        stt_base = CFG.get("stt", {}).get("url", "").rsplit("/v1/", 1)[0]
+        if not stt_base:
+            raise ValueError("stt url not configured")
         async with httpx.AsyncClient() as client:
-            r = await client.get("http://127.0.0.1:3201/v1/models", timeout=3)
+            r = await client.get(stt_base + "/v1/models", timeout=3)
             out["stt"] = "up" if r.status_code == 200 else f"http {r.status_code}"
     except Exception:
         out["stt"] = "down (lazy)"

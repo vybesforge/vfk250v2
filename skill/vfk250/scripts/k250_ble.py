@@ -23,36 +23,45 @@ def clean(txt: str) -> str:
     return txt.replace("\n", " ").replace("\r", " ").replace("\x00", "")
 
 
-def _take_object(buf):
-    """Pull one complete JSON object out of a notification buffer.
+# One decoder reused: raw_decode() pulls a single object off the front of the
+# buffer, which is what lets two concatenated reports both be delivered.
+_DECODER = json.JSONDecoder()
 
-    Returns `(obj, remaining)`. `obj` is None when the buffer does not hold a
-    complete object yet — a frame split across packets is a `{"AC"` fragment and
-    must simply wait for the rest.
 
-    On a frame that can NEVER parse, the buffer is first re-synced to the LAST
-    `{`: without that, a prefix of junk sits in front of every later frame, so
-    nothing parses again and `last` freezes at the last good state forever. Junk
-    with no `{` at all is dropped, and the buffer is capped so it cannot grow
-    without bound. Two complete objects arriving together yield the LAST one.
+def _take_objects(buf):
+    """Pull EVERY complete JSON object out of a notification buffer.
+
+    Returns `(objects, remaining)`. `remaining` is the tail that is not yet a
+    complete object (a frame split across packets) and must wait for more.
+
+    Draining ALL of them — not just the last — matters: two reports can arrive in
+    one notification (the box batches its echoes), and returning only the newest
+    would silently drop the other. A dropped report is exactly what a stop must
+    never miss.
+
+    On a frame that can never parse, the junk prefix is skipped by re-syncing to
+    the LAST `{`, and a buffer that cannot be salvaged is dropped (capped) so a bad
+    packet cannot wedge the reader on a stale `last` forever.
     """
-    if not buf:
-        return None, buf
-    try:
-        return json.loads(buf), ""
-    except Exception:
-        pass
-    i = buf.rfind("{")
-    if i < 0:
-        return None, ""
-    if i > 0:
-        buf = buf[i:]
-    if len(buf) > 4096:
-        return None, ""
-    try:
-        return json.loads(buf), ""
-    except Exception:
-        return None, buf
+    objs = []
+    while True:
+        s = buf.lstrip()
+        if not s:
+            return objs, ""
+        try:
+            obj, end = _DECODER.raw_decode(s)
+        except Exception:
+            i = s.rfind("{")
+            if i > 0:                 # junk in front of a frame: skip to the frame
+                buf = s[i:]
+                continue
+            buf = s if i == 0 else ""  # keep an unfinished frame; drop pure junk
+            break
+        objs.append(obj)
+        buf = s[end:]
+    if len(buf) > 4096:               # junk must not grow without bound
+        buf = ""
+    return objs, buf
 
 
 class K250:
@@ -60,17 +69,26 @@ class K250:
         self.cl = client
         self.buf = ""
         self.last = None
+        # Every PW report the box sends, counted. `last` is only the newest
+        # message, so a confirmation that polled `last` could miss a zero report
+        # that arrived just before another message, or read a stale value. These
+        # two make "wait for a FRESH zero report" exact: snapshot pw_seen before
+        # writing, wait for it to advance, then read pw_last.
+        self.pw_seen = 0
+        self.pw_last = None
 
     async def start(self):
         await self.cl.start_notify(CHR, self._on_notify)
 
     def _on_notify(self, _sender, data):
         self.buf += clean(data.decode("utf-8", "replace"))
-        obj, self.buf = _take_object(self.buf)
-        if obj is None:
-            return
-        self.last = obj
-        print("STATE:", json.dumps(obj, ensure_ascii=False), flush=True)
+        objs, self.buf = _take_objects(self.buf)
+        for obj in objs:
+            if isinstance(obj, dict) and "PW" in obj:
+                self.pw_seen += 1
+                self.pw_last = obj["PW"]
+            self.last = obj
+            print("STATE:", json.dumps(obj, ensure_ascii=False), flush=True)
 
     async def send(self, obj: dict):
         payload = json.dumps(obj, separators=(",", ":")).encode()

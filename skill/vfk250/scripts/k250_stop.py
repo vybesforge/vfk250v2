@@ -130,39 +130,40 @@ async def main():
         if isinstance(ca, list):
             chans = [i for i, s in enumerate(ca)
                      if str(s).strip().lower() != "unplugged"] or list(range(4))
-        for ch in chans:
-            await k.send({"AC": str(ch)})
-            await asyncio.sleep(0.05)
-            await k.send({"PW": "0"})
-            await asyncio.sleep(0.05)
 
-        # CONFIRMED only when the BOX reports PW=0. A write echo is the only
-        # witness — PW never appears in a read-all — so clear `last`, re-send the
-        # zero and wait for the echo. Re-sending PW=0 can never raise power, so
-        # retrying while we wait is safe; a missing echo is reported as UNCONFIRMED.
-        confirmed = False
-        for _ in range(3):
-            k.last = None
-            await k.send({"PW": "0"})
-            for _ in range(15):
-                pw = (k.last or {}).get("PW")
-                if pw is not None:
-                    try:
-                        confirmed = float(pw) == 0.0
-                    except (TypeError, ValueError):
-                        confirmed = False
+        # Zero AND confirm each channel, one at a time. A PW echo carries no
+        # channel id, so the AC select is what makes the report attributable to
+        # that channel — confirming only the last one would leave a two-channel
+        # stop unproven on the other. Re-sending PW=0 can never raise power, so
+        # retrying while we wait is safe; no FRESH report at all is UNCONFIRMED.
+        unconfirmed = []
+        for ch in chans:
+            ok_ch = False
+            for _ in range(3):
+                await k.send({"AC": str(ch)})
+                await asyncio.sleep(0.05)
+                seen = k.pw_seen
+                await k.send({"PW": "0"})
+                for _ in range(15):
+                    if k.pw_seen > seen and k.pw_last is not None:   # a fresh report
+                        try:
+                            ok_ch = float(k.pw_last) == 0.0
+                        except (TypeError, ValueError):
+                            ok_ch = False
+                        break
+                    await asyncio.sleep(0.1)
+                if ok_ch:
                     break
-                await asyncio.sleep(0.1)
-            if confirmed:
-                break
-        if confirmed:
-            print(f"STOPPED: PW=0 confirmed by the box on channels {[c + 1 for c in chans]}",
+            if not ok_ch:
+                unconfirmed.append(ch + 1)
+        if unconfirmed:
+            print(f"STOP UNCONFIRMED on channel(s) {unconfirmed} — IT MAY STILL BE ENERGISED!\n"
+                  f"  Get to it physically and hold any knob for 2 seconds to power it off.",
                   flush=True)
-            return 0
-        print("STOP UNCONFIRMED: the box never reported PW=0 — IT MAY STILL BE ENERGISED!\n"
-              "  Get to it physically and hold any knob for 2 seconds to power it off.",
+            return 1
+        print(f"STOPPED: PW=0 confirmed by the box on channels {[c + 1 for c in chans]}",
               flush=True)
-        return 1
+        return 0
     return 0
 
 

@@ -196,24 +196,39 @@ def _ch_active(ca, i: int) -> bool:
     return False
 
 
-async def _zero_reported(k, tries: int = 3) -> bool:
-    """True only when the BOX reports PW=0. A write echo is the only witness —
-    PW never appears in a read-all — so clear `last`, re-send the zero and wait
-    for the echo. Re-sending PW=0 can never raise power, so retrying while we
-    wait is safe. Writing zero and assuming it landed is the claim the stop rule
-    forbids; this is what gates 'all zeroed (ended)'."""
-    for _ in range(tries):
-        k.last = None
-        await k.send({"PW": "0"})
-        for _ in range(15):
-            pw = (k.last or {}).get("PW")
-            if pw is not None:
-                try:
-                    return float(pw) == 0.0
-                except (TypeError, ValueError):
-                    return False
-            await asyncio.sleep(0.1)
-    return False
+async def _zero_reported(k, chans, tries: int = 3) -> bool:
+    """True only when the BOX reports PW=0 on EVERY channel we drove.
+
+    A write echo is the only witness (PW never appears in a read-all) and it
+    carries no channel id — so each channel is selected, zeroed and confirmed in
+    turn. Confirming only the last one would leave a second channel unproven.
+
+    The wait is on a FRESH report (`pw_seen` advancing), so a value already
+    sitting in `last` can neither satisfy the check nor fail it, and two reports
+    arriving together cannot hide the zero. A non-zero answer is retried rather
+    than believed: the box holds its last power, so one old reading is noise —
+    but it is not proof either. Re-sending PW=0 can never raise power.
+    """
+    for ch in chans:
+        ok = False
+        for _ in range(tries):
+            await k.send({"AC": str(ch)})
+            await asyncio.sleep(0.05)
+            seen = k.pw_seen
+            await k.send({"PW": "0"})
+            for _ in range(15):
+                if k.pw_seen > seen and k.pw_last is not None:
+                    try:
+                        ok = float(k.pw_last) == 0.0
+                    except (TypeError, ValueError):
+                        ok = False
+                    break
+                await asyncio.sleep(0.1)
+            if ok:
+                break
+        if not ok:
+            return False
+    return True
 
 
 async def main() -> int:
@@ -393,7 +408,7 @@ async def main() -> int:
                         await asyncio.sleep(0.15)
                 # The box must REPORT zero — the writes going out over a live link
                 # is not the same claim, and a read-all never carries PW.
-                confirmed = await _zero_reported(k)
+                confirmed = await _zero_reported(k, driven)
                 if not confirmed:
                     raise RuntimeError("the box never echoed PW=0")
                 await asyncio.sleep(0.8)
@@ -419,7 +434,7 @@ async def main() -> int:
                             await k2.send({"PW": "0"})
                             await asyncio.sleep(0.05)
                         await asyncio.sleep(0.5)
-                        confirmed = await _zero_reported(k2)
+                        confirmed = await _zero_reported(k2, driven)
                         if not confirmed:
                             raise RuntimeError("the box never echoed PW=0 after reconnect")
                         await k2.send(READ_ALL)
