@@ -19,6 +19,7 @@ import subprocess
 import sys
 import time
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -91,7 +92,15 @@ def _origin_ok(origin: str | None) -> bool:
     return bool(_LOCAL_ORIGIN.match(origin)) or origin in _allowed_origins()
 
 
-app = FastAPI(title="vfk250-web")
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    """Startup/shutdown. The startup work lives in _on_startup() (defined with the
+    workers, below); this replaces the deprecated @app.on_event("startup")."""
+    await _on_startup()
+    yield
+
+
+app = FastAPI(title="vfk250-web", lifespan=_lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_allowed_origins(),
@@ -267,8 +276,9 @@ def _check_pattern_drift() -> None:
         print(f"[warn] pattern drift check skipped: {e}", flush=True)
 
 
-@app.on_event("startup")
-async def _start_queue_worker() -> None:
+async def _on_startup() -> None:
+    """Kick off the queue worker + the log-only pattern drift check, and prewarm
+    Qwen-Edit if configured. Run from the lifespan handler."""
     asyncio.create_task(_queue_worker())
     _check_pattern_drift()
     if COMFY_CFG.get("prewarm_on_start"):
